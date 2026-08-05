@@ -15,6 +15,9 @@
  * @TOUCH_MODE_NONUI_MODE: Disables or enables currently enabled gestures.
  * @TOUCH_MODE_REPORT_RATE: Configures the touchscreen sampling rate.
  * @TOUCH_MODE_FOLD_STATUS: Informs the xiaomi touch driver about current fold status.
+ * @TOUCH_MODE_STYLUS_CONNECTION: Reports a stylus connection event; GET returns
+ *                                whether a supported, unshielded pen is connected.
+ * @TOUCH_MODE_PEN_SHORTHAND: Enables the controller's native off-screen pen input.
  * @TOUCH_MODE_NUM: Represents the total number of supported modes.
  *
  * This enumeration is used to identify modes when configuring or querying
@@ -28,8 +31,19 @@ enum touch_mode {
 	TOUCH_MODE_NONUI_MODE,
 	TOUCH_MODE_REPORT_RATE,
 	TOUCH_MODE_FOLD_STATUS,
+	TOUCH_MODE_STYLUS_CONNECTION,
+	/* Value 8 belonged to the removed liuqin pen-detach wake policy. */
+	TOUCH_MODE_PEN_SHORTHAND = 9,
 	TOUCH_MODE_NUM,
 };
+
+/*
+ * NT36532 stylus events retain the stock encoding: 0x12 adds a supported
+ * connection, 0x02 removes one, and -1 resets the count. 0x11/0x01 set/clear
+ * legacy-pen shielding. All other generation deltas are no-ops, matching the
+ * stock controller. These are delta events, not an idempotent enable flag.
+ * This encoding applies to TOUCH_MODE_STYLUS_CONNECTION, not sensor events.
+ */
 
 /**
  * enum touch_mode_cmd: - Defines commands for interacting with touchscreen modes.

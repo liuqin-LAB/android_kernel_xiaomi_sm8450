@@ -34,6 +34,12 @@ struct xiaomi_touch_interface {
 	 * This typically contains the core data necessary for the callbacks.
 	 */
 	void *private;
+
+	/*
+	 * Apply gesture requests while resumed, before TDDI panel power-down.
+	 * This does not make a controller able to change modes while suspended.
+	 */
+	bool gesture_mode_before_suspend;
 };
 
 enum touch_id {
