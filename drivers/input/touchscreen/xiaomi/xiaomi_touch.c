@@ -23,6 +23,7 @@ struct class *touch_class;
 struct device *touch_dev;
 
 static struct xiaomi_touch_interface *interfaces[TOUCH_ID_NUM];
+static DEFINE_MUTEX(interface_lock);
 
 static struct workqueue_struct *register_panel_wq;
 static struct delayed_work register_panel_work;
@@ -104,22 +105,43 @@ struct touch_mode_attribute {
 	enum touch_mode touch_mode;
 };
 
+static void oneshot_sensor_update_driver(enum touch_id touch_id, bool enabled,
+					atomic_t requested_state[]);
+
 int register_xiaomi_touch_client(enum touch_id touch_id,
 				 struct xiaomi_touch_interface *interface)
 {
-	if (touch_id >= TOUCH_ID_NUM || interfaces[touch_id])
-		return -EINVAL;
-	interfaces[touch_id] = interface;
+	int ret = 0;
 
-	return 0;
+	if ((unsigned int)touch_id >= TOUCH_ID_NUM || !interface)
+		return -EINVAL;
+	mutex_lock(&interface_lock);
+	if (interfaces[touch_id]) {
+		ret = -EINVAL;
+		goto out;
+	}
+	interfaces[touch_id] = interface;
+	if (touch_id == active_touch_id && interface->gesture_mode_before_suspend)
+		oneshot_sensor_update_driver(touch_id, true,
+					     oneshot_sensor_enabled_requested);
+out:
+	mutex_unlock(&interface_lock);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(register_xiaomi_touch_client);
 
 int unregister_xiaomi_touch_client(enum touch_id touch_id)
 {
-	if (touch_id >= TOUCH_ID_NUM)
+	int i;
+
+	if ((unsigned int)touch_id >= TOUCH_ID_NUM)
 		return -EINVAL;
+	mutex_lock(&interface_lock);
 	interfaces[touch_id] = NULL;
+	for (i = 0; i < ONESHOT_SENSOR_TYPE_NUM; i++)
+		atomic_set(&oneshot_sensor_enabled[touch_id][i], 0);
+	mutex_unlock(&interface_lock);
 
 	return 0;
 }
@@ -129,7 +151,7 @@ int notify_oneshot_sensor(enum oneshot_sensor_type sensor_type, int value)
 {
 	struct oneshot_sensor *sensor;
 
-	if (sensor_type >= ONESHOT_SENSOR_TYPE_NUM ||
+	if ((unsigned int)sensor_type >= ONESHOT_SENSOR_TYPE_NUM ||
 	    !oneshot_sensor_map[sensor_type]) {
 		pr_err("tried to notify for invalid oneshot sensor %d\n",
 		       sensor_type);
@@ -167,6 +189,7 @@ static void oneshot_sensor_update_driver(enum touch_id touch_id, bool enabled,
 	int i;
 	struct xiaomi_touch_interface *interface;
 
+	lockdep_assert_held(&interface_lock);
 	interface = interfaces[touch_id];
 	if (!interface || !interface->get_mode_value ||
 	    !interface->set_mode_value)
@@ -175,22 +198,26 @@ static void oneshot_sensor_update_driver(enum touch_id touch_id, bool enabled,
 	for (i = 0; i < ONESHOT_SENSOR_TYPE_NUM; i++) {
 		int requested_value =
 			enabled ? atomic_read(&requested_state[i]) : 0;
-		if (atomic_xchg(&oneshot_sensor_enabled[touch_id][i], requested_value) !=
+		if (atomic_read(&oneshot_sensor_enabled[touch_id][i]) !=
 		    requested_value) {
 			pr_debug("setting mode %d to %d!\n", i,
 				 requested_value);
-			interface->set_mode_value(interface->private,
-						  oneshot_sensor_map[i]->mode,
-						  requested_value);
+			if (!interface->set_mode_value(interface->private,
+						 oneshot_sensor_map[i]->mode,
+						 requested_value))
+				atomic_set(&oneshot_sensor_enabled[touch_id][i],
+					   requested_value);
 		}
 	}
 }
 
 static void oneshot_sensor_enable_handler(struct work_struct *work)
 {
+	mutex_lock(&interface_lock);
 	if (atomic_read(&suspended))
 		oneshot_sensor_update_driver(active_touch_id, true,
 					     oneshot_sensor_enabled_requested);
+	mutex_unlock(&interface_lock);
 }
 
 static ssize_t oneshot_sensor_status_show(struct device *dev,
@@ -227,6 +254,7 @@ static ssize_t oneshot_sensor_enabled_store(struct device *dev,
 {
 	struct oneshot_sensor_attribute *sensor_attribute =
 		container_of(attr, struct oneshot_sensor_attribute, dev_attr);
+	struct xiaomi_touch_interface *interface;
 	unsigned int enable;
 
 	if (kstrtouint(arg, 10, &enable))
@@ -240,9 +268,16 @@ static ssize_t oneshot_sensor_enabled_store(struct device *dev,
 		    &oneshot_sensor_enabled_requested[sensor_attribute->type],
 		    enable) != enable) {
 		cancel_delayed_work_sync(&oneshot_sensor_enable_work);
-		queue_delayed_work(oneshot_sensor_enable_wq,
-				   &oneshot_sensor_enable_work,
-				   msecs_to_jiffies(300));
+		mutex_lock(&interface_lock);
+		interface = interfaces[active_touch_id];
+		if (interface && interface->gesture_mode_before_suspend)
+			oneshot_sensor_update_driver(active_touch_id, true,
+						     oneshot_sensor_enabled_requested);
+		else
+			queue_delayed_work(oneshot_sensor_enable_wq,
+					   &oneshot_sensor_enable_work,
+					   msecs_to_jiffies(300));
+		mutex_unlock(&interface_lock);
 		sysfs_notify(&dev->kobj, NULL, attr->attr.name);
 	}
 
@@ -302,7 +337,7 @@ static const struct attribute_group oneshot_sensor_group = {
 	.attrs = oneshot_sensor_attrs,
 };
 
-static int touch_mode_get(enum touch_mode mode)
+static int touch_mode_get_locked(enum touch_mode mode)
 {
 	struct xiaomi_touch_interface *interface;
 
@@ -332,10 +367,11 @@ static int touch_mode_get(enum touch_mode mode)
 	return interface->get_mode_value(interface->private, mode);
 }
 
-static int touch_mode_set(enum touch_mode mode, int value)
+static int touch_mode_set_locked(enum touch_mode mode, int value)
 {
 	struct xiaomi_touch_interface *interface;
 	enum touch_id requested_touch_id;
+	int i, ret;
 
 	// The following modes are not passed down to the touch driver
 	switch (mode) {
@@ -375,9 +411,43 @@ static int touch_mode_set(enum touch_mode mode, int value)
 	if (!interface || !interface->set_mode_value)
 		return -EFAULT;
 
-	interface->set_mode_value(interface->private, mode, value);
+	ret = interface->set_mode_value(interface->private, mode, value);
+	if (ret)
+		return ret;
+
+	if (interface->gesture_mode_before_suspend) {
+		for (i = 0; i < ONESHOT_SENSOR_TYPE_NUM; i++) {
+			if (oneshot_sensor_map[i]->mode != mode)
+				continue;
+			atomic_set(&oneshot_sensor_enabled_requested[i], value);
+			atomic_set(&oneshot_sensor_enabled[active_touch_id][i], value);
+			sysfs_notify(&touch_dev->kobj, NULL,
+				     oneshot_sensor_map[i]->enabled_name);
+			break;
+		}
+	}
 
 	return 0;
+}
+
+static int touch_mode_get(enum touch_mode mode)
+{
+	int ret;
+
+	mutex_lock(&interface_lock);
+	ret = touch_mode_get_locked(mode);
+	mutex_unlock(&interface_lock);
+	return ret;
+}
+
+static int touch_mode_set(enum touch_mode mode, int value)
+{
+	int ret;
+
+	mutex_lock(&interface_lock);
+	ret = touch_mode_set_locked(mode, value);
+	mutex_unlock(&interface_lock);
+	return ret;
 }
 
 static ssize_t touch_mode_show(struct device *dev,
@@ -400,10 +470,10 @@ static ssize_t touch_mode_store(struct device *dev,
 {
 	struct touch_mode_attribute *mode_attribute =
 		container_of(attr, struct touch_mode_attribute, dev_attr);
-	unsigned int value;
+	int value;
 	int set_success;
 
-	if (kstrtouint(arg, 10, &value))
+	if (kstrtoint(arg, 10, &value))
 		return -EINVAL;
 
 	set_success = touch_mode_set(mode_attribute->touch_mode, value);
@@ -429,10 +499,14 @@ static ssize_t touch_mode_store(struct device *dev,
 
 TOUCH_MODE_ATTR_RW(bump_sample_rate, TOUCH_MODE_REPORT_RATE);
 TOUCH_MODE_ATTR_RW(fod_finger_state, TOUCH_MODE_FOD_FINGER_STATE);
+TOUCH_MODE_ATTR_RW(stylus_connection, TOUCH_MODE_STYLUS_CONNECTION);
+TOUCH_MODE_ATTR_RW(gesture_pen_tap_enabled, TOUCH_MODE_PEN_SHORTHAND);
 
 static struct attribute *touch_mode_attrs[] = {
 	&touch_mode_attr_bump_sample_rate.dev_attr.attr,
 	&touch_mode_attr_fod_finger_state.dev_attr.attr,
+	&touch_mode_attr_stylus_connection.dev_attr.attr,
+	&touch_mode_attr_gesture_pen_tap_enabled.dev_attr.attr,
 	NULL,
 };
 
@@ -662,9 +736,9 @@ static void __exit xiaomi_touch_exit(void)
 {
 	cancel_delayed_work_sync(&register_panel_work);
 	destroy_workqueue(register_panel_wq);
-	if (!IS_ERR(panel_cookie_primary))
+	if (!IS_ERR_OR_NULL(panel_cookie_primary))
 		panel_event_notifier_unregister(panel_cookie_primary);
-	if (!IS_ERR(panel_cookie_secondary))
+	if (!IS_ERR_OR_NULL(panel_cookie_secondary))
 		panel_event_notifier_unregister(panel_cookie_secondary);
 	device_unregister(touch_dev);
 	class_destroy(touch_class);
