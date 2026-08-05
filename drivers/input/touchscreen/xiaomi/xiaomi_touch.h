@@ -34,6 +34,8 @@ struct xiaomi_touch_interface {
 	 * This typically contains the core data necessary for the callbacks.
 	 */
 	void *private;
+
+	bool gesture_mode_before_suspend;
 };
 
 enum touch_id {
